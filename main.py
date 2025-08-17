@@ -104,6 +104,12 @@ def advance_state(chat_id: int, user_text: str):
     choice = (user_text or "").strip().lower()
     s["recent_choices"].append(choice[:20])
 
+    # Reset if player wants to start again
+    if "start again" in choice or "restart" in choice:
+        s["act"], s["beat"], s["recent_choices"] = 1, 1, []
+        return
+
+    # Normal progression rules
     if choice.startswith(("1)", "2)", "3)", "4)")) or choice in {"1", "2", "3", "4"}:
         s["beat"] += 1
     elif "new journey" in choice:
@@ -115,12 +121,14 @@ def advance_state(chat_id: int, user_text: str):
     else:
         s["beat"] += 1
 
+    # Roll to next act at boundaries
     if s["act"] == 1 and s["beat"] > 4:
         s["act"], s["beat"] = 2, 5
     elif s["act"] == 2 and s["beat"] > 8:
         s["act"], s["beat"] = 3, 9
     elif s["act"] == 3 and s["beat"] > 10:
-        s["beat"] = 10
+        s["beat"] = 10  # hold at last beat
+
 
 # --- History helpers ---
 def get_history(chat_id: int) -> List[Dict[str, str]]:
