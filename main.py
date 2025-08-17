@@ -68,6 +68,7 @@ Special rules:
 - The entire story should resolve in about 20–30 prompts; steer narration toward development and eventual ending.  
 - Introduce puzzles at key points; if the player solves them incorrectly, branch into darker or worse outcomes.  
 - Introduce occasional bonuses or items; these should improve the player’s chances of survival or success against enemies.  
+- If the player chooses option 4 (Other) or types “Other”, do not advance the story beat yet. Ask the player to describe their action, or propose 2–3 concrete custom actions they could take, then wait for their input. Advance only after they provide a specific action.
 
 Opening behaviour:
 On the first reply in any new chat or after /start do not narrate the story. Greet in a Victorian gothic voice and ask:
@@ -81,7 +82,7 @@ Narration (3–5 sentences). Then a numbered list of 2–4 actions. Then “Othe
 
 # --- State helpers ---
 def init_state(chat_id: int):
-    STATE[chat_id] = {"act": 1, "beat": 1, "recent_choices": []}
+    STATE[chat_id] = {"act": 1, "beat": 1, "recent_choices": [], "awaiting_other": False}
 
 def state_summary(chat_id: int) -> str:
     s = STATE.get(chat_id)
@@ -104,30 +105,48 @@ def advance_state(chat_id: int, user_text: str):
     choice = (user_text or "").strip().lower()
     s["recent_choices"].append(choice[:20])
 
-    # Reset if player wants to start again
+    # Reset to start
     if "start again" in choice or "restart" in choice:
-        s["act"], s["beat"], s["recent_choices"] = 1, 1, []
+        s["act"], s["beat"], s["recent_choices"], s["awaiting_other"] = 1, 1, [], False
         return
 
-    # Normal progression rules
-    if choice.startswith(("1)", "2)", "3)", "4)")) or choice in {"1", "2", "3", "4"}:
-        s["beat"] += 1
-    elif "new journey" in choice:
-        s["act"], s["beat"], s["recent_choices"] = 1, 1, []
-    elif "continue" in choice:
-        s["beat"] += 1
-    elif "other" in choice:
+    # If we are waiting for a custom action from a previous "Other"
+    if s.get("awaiting_other"):
+        # If the player now gives any non-numeric action, accept it and advance
+        if choice not in {"1", "2", "3", "4"} and not choice.startswith(("1)", "2)", "3)", "4)")):
+            s["awaiting_other"] = False
+            s["beat"] += 1
+            # Act rollovers
+            if s["act"] == 1 and s["beat"] > 4:
+                s["act"], s["beat"] = 2, 5
+            elif s["act"] == 2 and s["beat"] > 8:
+                s["act"], s["beat"] = 3, 9
+            elif s["act"] == 3 and s["beat"] > 10:
+                s["beat"] = 10
+        # If they typed 1–4 again while we are waiting, do not advance yet
+        return
+
+    # New input, not currently waiting for "Other"
+    # Option 4 or explicit "other" sets the waiting flag and does not advance
+    if choice in {"4"} or choice.startswith("4)") or "other" in choice:
+        s["awaiting_other"] = True
+        return
+
+    # Normal numeric choices 1–3 advance
+    if choice in {"1", "2", "3"} or choice.startswith(("1)", "2)", "3)")):
         s["beat"] += 1
     else:
+        # Free text without choosing 4: treat as a concrete action and advance
         s["beat"] += 1
 
-    # Roll to next act at boundaries
+    # Act rollovers
     if s["act"] == 1 and s["beat"] > 4:
         s["act"], s["beat"] = 2, 5
     elif s["act"] == 2 and s["beat"] > 8:
         s["act"], s["beat"] = 3, 9
     elif s["act"] == 3 and s["beat"] > 10:
-        s["beat"] = 10  # hold at last beat
+        s["beat"] = 10
+
 
 
 # --- History helpers ---
