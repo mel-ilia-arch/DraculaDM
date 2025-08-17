@@ -128,25 +128,27 @@ def append_msg(chat_id: int, role: str, content: str):
     if len(hist) > 40:
         SESSIONS[chat_id] = [hist[0]] + hist[-30:]
 
-# --- OpenAI call (injects state each turn) ---
+# --- OpenAI call (works on all current SDKs) ---
 async def call_openai(chat_id: int) -> str:
     msgs = get_history(chat_id).copy()
     msgs.append({"role": "system", "content": state_summary(chat_id)})
-    resp = client.responses.create(
-        model="gpt-4o-mini",
-        input=[{"role": m["role"], "content": m["content"]} for m in msgs],
-        temperature=0.7,
-        max_output_tokens=350,
-    )
+
+    # Format for chat.completions
+    messages = [{"role": m["role"], "content": m["content"]} for m in msgs]
+
     try:
-        return resp.output_text
-    except Exception:
-        # Fallback if SDK structure changes
-        for block in getattr(resp, "output", []):
-            if getattr(block, "type", "") == "message":
-                parts = block.message.get("content", [])
-                return "".join(p.get("text", "") for p in parts if p.get("type") == "output_text")
-        return "…"
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            temperature=0.7,
+            max_tokens=350,
+        )
+        return resp.choices[0].message.content
+    except Exception as e:
+        # Last resort text if something unusual happens
+        logging.exception("OpenAI call failed")
+        return f"Error talking to the model: {e}"
+
 
 # --- Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
