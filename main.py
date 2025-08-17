@@ -213,10 +213,15 @@ async def _shutdown():
 async def telegram_webhook(secret: str, request: Request):
     if secret != WEBHOOK_SECRET:
         return Response(status_code=401)
+
     data = await request.json()
     update = Update.de_json(data, tg_app.bot)
-    await tg_app.update_queue.put(update)
+
+    # Process the update asynchronously so we return fast to Telegram
+    asyncio.create_task(tg_app.process_update(update))
+
     return {"ok": True}
+
 
 @api.get("/health")
 async def health():
