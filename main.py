@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import logging
 import asyncio
@@ -63,7 +64,6 @@ def _rget(key: str) -> Any:
 
 def _rset(key: str, value: Any) -> None:
     if r:
-        # Set TTL so sessions survive restarts but do not grow forever
         r.set(key, json.dumps(value), ex=SESSION_TTL_SEC)
 
 # ---------- In-memory fallback ----------
@@ -214,7 +214,6 @@ def advance_state(chat_id: int, user_text: str) -> None:
         if choice not in {"1", "2", "3", "4"} and not choice.startswith(("1)", "2)", "3)", "4)")):
             s["awaiting_other"] = False
             s["beat"] += 1
-            # act rollovers
             if s["act"] == 1 and s["beat"] > 4:
                 s["act"], s["beat"] = 2, 5
             elif s["act"] == 2 and s["beat"] > 8:
@@ -231,10 +230,7 @@ def advance_state(chat_id: int, user_text: str) -> None:
         return
 
     # normal numeric or free text choices advance
-    if choice in {"1", "2", "3"} or choice.startswith(("1)", "2)", "3)")):
-        s["beat"] += 1
-    else:
-        s["beat"] += 1
+    s["beat"] += 1
 
     if s["act"] == 1 and s["beat"] > 4:
         s["act"], s["beat"] = 2, 5
@@ -245,38 +241,158 @@ def advance_state(chat_id: int, user_text: str) -> None:
 
     save_state(chat_id, s)
 
-# ---------- OpenAI call (async, bounded, with retries at SDK level) ----------
+# ---------- Telegram-safe chunking ----------
+TELEGRAM_HARD_LIMIT = 4096
+CHUNK_LIMIT = 4000  # safety margin
+
+_sentence_splitter = re.compile(r'(?<=[\.!\?])\s+')
+
+def _split_long_text(text: str, limit: int = CHUNK_LIMIT) -> List[str]:
+    """
+    Splits text into chunks under Telegram's limit.
+    Prefers paragraph and sentence boundaries. Falls back to whitespace cut.
+    Tries to keep code fences balanced across chunks.
+    """
+    chunks: List[str] = []
+    in_code = False
+    buf = ""
+
+    def flush_buffer():
+        nonlocal buf, in_code
+        if not buf:
+            return
+        # balance code fences inside this chunk
+        tick_count = buf.count("```")
+        if tick_count % 2 == 1:
+            if in_code:
+                # close fence at end
+                buf_to_send = buf + "\n```"
+                in_code = False
+            else:
+                # open fence at start
+                buf_to_send = "```\n" + buf
+                in_code = True
+        else:
+            buf_to_send = buf
+        chunks.append(buf_to_send)
+        buf = ""
+
+    # First pass by paragraphs
+    paragraphs = text.split("\n\n")
+    for p in paragraphs:
+        candidate = (buf + ("\n\n" if buf else "") + p) if buf else p
+        if len(candidate) <= limit:
+            buf = candidate
+            continue
+
+        # If a single paragraph is too big, split by sentences
+        if len(p) > limit:
+            sentences = _sentence_splitter.split(p)
+            cur = buf
+            for s in sentences:
+                s = s.strip()
+                if not s:
+                    continue
+                add = (cur + " " + s).strip() if cur else s
+                if len(add) <= limit:
+                    cur = add
+                else:
+                    if cur:
+                        buf = cur
+                        flush_buffer()
+                    # fallback: hard cut very long sentence
+                    while len(s) > limit:
+                        cut_at = s.rfind(" ", 0, limit)
+                        if cut_at == -1:
+                            cut_at = limit
+                        part, s = s[:cut_at].rstrip(), s[cut_at:].lstrip()
+                        buf = part
+                        flush_buffer()
+                    cur = s
+            if cur:
+                if buf:
+                    buf = (buf + "\n\n" + cur) if len(buf) + 2 + len(cur) <= limit else buf
+                    if len(buf) + 2 + len(cur) > limit:
+                        flush_buffer()
+                        buf = cur
+                else:
+                    buf = cur
+        else:
+            # flush current buf and start fresh with paragraph
+            flush_buffer()
+            if len(p) <= limit:
+                buf = p
+            else:
+                # unlikely branch because handled above, kept for safety
+                start = 0
+                while start < len(p):
+                    end = min(start + limit, len(p))
+                    cut_at = p.rfind(" ", start, end)
+                    if cut_at == -1 or cut_at <= start + limit // 2:
+                        cut_at = end
+                    buf = p[start:cut_at].strip()
+                    flush_buffer()
+                    start = cut_at
+
+    if buf:
+        flush_buffer()
+
+    return chunks
+
+async def safe_reply(message, text: str):
+    parts = _split_long_text(text, CHUNK_LIMIT)
+    for part in parts:
+        try:
+            await message.reply_text(part, disable_web_page_preview=True)
+        except Exception as e:
+            logging.warning(f"reply_text failed once: {e}; retrying…")
+            await asyncio.sleep(0.7)
+            await message.reply_text(part, disable_web_page_preview=True)
+
+# ---------- OpenAI call (continuation if truncated, then chunk-send) ----------
 async def call_openai(chat_id: int) -> str:
     msgs = get_history(chat_id).copy()
     msgs.append({"role": "system", "content": state_summary(chat_id)})
     messages = [{"role": m["role"], "content": m["content"]} for m in msgs]
 
     try:
-        resp = await asyncio.wait_for(
+        first = await asyncio.wait_for(
             client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=messages,
                 temperature=0.7,
-                max_tokens=350,
-                timeout=30,  # API call internal timeout
+                max_tokens=500,  # give a little more room to avoid mid-sentence cuts
+                timeout=30,
             ),
-            timeout=35,      # outer safety net
+            timeout=35,
         )
-        return resp.choices[0].message.content
+        content = first.choices[0].message.content
+        finish = getattr(first.choices[0], "finish_reason", None)
+
+        # If the model stopped due to length, request a short continuation
+        if finish == "length":
+            cont = await asyncio.wait_for(
+                client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=messages + [
+                        {"role": "assistant", "content": content},
+                        {"role": "user", "content": "Continue exactly where you stopped and finish the response cleanly."},
+                    ],
+                    temperature=0.7,
+                    max_tokens=200,
+                    timeout=30,
+                ),
+                timeout=35,
+            )
+            content = content + cont.choices[0].message.content
+
+        return content
+
     except asyncio.TimeoutError:
         return "The narrator falls silent in a storm of static. Try your last action again."
     except Exception as e:
         logging.exception("OpenAI call failed")
         return f"Error talking to the model: {e}"
-
-# ---------- Safe reply helper with one retry ----------
-async def safe_reply(message, text: str):
-    try:
-        await message.reply_text(text)
-    except Exception as e:
-        logging.warning(f"reply_text failed once: {e}; retrying…")
-        await asyncio.sleep(0.7)
-        await message.reply_text(text)
 
 # ---------- Handlers ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -285,7 +401,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     init_state(chat_id)
     append_msg(chat_id, "user", "/start")
 
-    # show liveness
     await update.message.chat.send_action(ChatAction.TYPING)
 
     reply = await call_openai(chat_id)
